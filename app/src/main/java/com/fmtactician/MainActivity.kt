@@ -8,34 +8,33 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.Gravity
 import android.widget.*
 import androidx.core.content.ContextCompat
 
 class MainActivity : Activity() {
-    private val prefs by lazy { getSharedPreferences("squad", Context.MODE_PRIVATE) }
     private val REQ = 42
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         val d = resources.displayMetrics.density
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding((20*d).toInt(), (40*d).toInt(), (20*d).toInt(), (20*d).toInt()) }
-        root.addView(TextView(this).apply { text = "FM Tactician"; textSize = 26f })
-        root.addView(TextView(this).apply { text = "1. Tick your squad's strengths:"; setPadding(0, (16*d).toInt(), 0, 0) })
-        val saved = prefs.getStringSet("traits", emptySet()) ?: emptySet()
-        SQUAD_TRAITS.forEach { (k, label) ->
-            root.addView(CheckBox(this).apply {
-                text = label; isChecked = k in saved
-                setOnCheckedChangeListener { _, on ->
-                    val s = (prefs.getStringSet("traits", emptySet()) ?: emptySet()).toMutableSet()
-                    if (on) s.add(k) else s.remove(k)
-                    prefs.edit().putStringSet("traits", s).apply()
-                }
-            })
-        }
-        root.addView(Button(this).apply { text = "2. Allow display over other apps"; setOnClickListener {
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+            setPadding((20*d).toInt(), (40*d).toInt(), (20*d).toInt(), (20*d).toInt()) }
+        root.addView(ImageView(this).apply { setImageResource(R.drawable.ic_logo)
+            layoutParams = LinearLayout.LayoutParams((110*d).toInt(), (110*d).toInt()) })
+        root.addView(TextView(this).apply { text = "FM Tactician"; textSize = 26f; gravity = Gravity.CENTER })
+        root.addView(TextView(this).apply { textSize = 15f; setPadding(0, (12*d).toInt(), 0, (12*d).toInt())
+            text = "Setup, once:\n1. Allow display over other apps.\n2. Start the bubble.\n\n" +
+                "In Football Manager, tap the ⚽ bubble and use the side window:\n" +
+                "☐ My Team: open your team overview, tap My Team\n" +
+                "☐ Lineup: open your lineup, tap Lineup\n" +
+                "☐ Player: open each player's profile, tap Player (repeat)\n" +
+                "☐ Opponent: open the opponent's report, tap Opponent for Attack, Defence, Shape and Set Piece advice." })
+        root.addView(Button(this).apply { text = "1. Allow display over other apps"; setOnClickListener {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) } })
-        root.addView(Button(this).apply { text = "3. Start bubble"; setOnClickListener { start() } })
-        root.addView(TextView(this).apply { text = "Then open Football Manager, go to the opponent's scouting screen and tap the ⚽ bubble."; setPadding(0, (12*d).toInt(), 0, 0) })
+        root.addView(Button(this).apply { text = "2. Start bubble"; setOnClickListener { start() } })
+        root.addView(Button(this).apply { text = "Reset saved team data"; setOnClickListener {
+            Store(this@MainActivity).clear(); toast("Saved data cleared") } })
         setContentView(ScrollView(this).apply { addView(root) })
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
     }
