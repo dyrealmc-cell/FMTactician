@@ -13,6 +13,7 @@ import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.*
+import android.util.DisplayMetrics
 import android.view.*
 import android.widget.*
 import com.google.mlkit.vision.common.InputImage
@@ -28,15 +29,13 @@ class OverlayService : Service() {
     private var panel: LinearLayout? = null
     private var panelLp: WindowManager.LayoutParams? = null
     private var outTv: TextView? = null
-    private var rowViews = listOf<TextView>()
-    private var oppDone = false
+    private var statusTv: TextView? = null
     private var projection: MediaProjection? = null
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
     private var last: Image? = null
     private var w = 0; private var h = 0
     private val ocr = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    private val KINDS = listOf("team" to "My Team", "lineup" to "Lineup", "player" to "Player", "opp" to "Opponent")
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -64,17 +63,42 @@ class OverlayService : Service() {
         else startForeground(1, n)
     }
 
-    // One capture session kept alive (Android 14 forbids reusing the token).
-    private fun startCapture() {
-        val dm = resources.displayMetrics
-        w = dm.widthPixels; h = dm.heightPixels
-        reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
-        reader!!.setOnImageAvailableListener({ r ->
-            val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+    @Suppress("DEPRECATION")
+    private fun realSize(): DisplayMetrics {
+        val dm = DisplayMetrics()
+        getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(dm)
+        return dm
+    }
+
+    private fun newReader(): ImageReader {
+        val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
+        r.setOnImageAvailableListener({ x ->
+            val img = x.acquireLatestImage() ?: return@setOnImageAvailableListener
             last?.close(); last = img
         }, handler)
+        return r
+    }
+
+    // One capture session kept alive (Android 14 forbids reusing the token).
+    private fun startCapture() {
+        val dm = realSize(); w = dm.widthPixels; h = dm.heightPixels
+        reader = newReader()
         vd = projection!!.createVirtualDisplay("fmscan", w, h, dm.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader!!.surface, null, handler)
+    }
+
+    // FM runs in landscape: resize the capture when the screen rotates.
+    private fun ensureSize(): Boolean {
+        val dm = realSize()
+        if (dm.widthPixels == w && dm.heightPixels == h) return false
+        w = dm.widthPixels; h = dm.heightPixels
+        last?.close(); last = null
+        val old = reader
+        reader = newReader()
+        vd?.resize(w, h, dm.densityDpi)
+        vd?.surface = reader!!.surface
+        old?.close()
+        return true
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -84,8 +108,14 @@ class OverlayService : Service() {
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT).apply { gravity = grav }
 
     private fun tv(txt: String, size: Float, click: (() -> Unit)? = null) = TextView(this).apply {
-        text = txt; textSize = size; setTextColor(Color.WHITE); setPadding(dp(8), dp(7), dp(8), dp(7))
+        text = txt; textSize = size; setTextColor(Color.WHITE); setPadding(dp(8), dp(6), dp(8), dp(6))
         if (click != null) setOnClickListener { click() }
+    }
+
+    private fun btn(txt: String, click: () -> Unit) = tv(txt, 13f, click).apply {
+        gravity = Gravity.CENTER
+        background = GradientDrawable().apply { cornerRadius = dp(8).toFloat(); setColor(Color.parseColor("#6A1BD9")) }
+        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(2), dp(2), dp(2), dp(2)) }
     }
 
     private fun addBubble() {
@@ -93,7 +123,7 @@ class OverlayService : Service() {
             text = "⚽"; textSize = 22f; gravity = Gravity.CENTER
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor("#E61B5E20")) }
         }
-        val lp = overlayParams(dp(48), dp(48), Gravity.TOP or Gravity.START).apply { x = 0; y = dp(200) }
+        val lp = overlayParams(dp(48), dp(48), Gravity.TOP or Gravity.START).apply { x = 0; y = dp(120) }
         var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
         b.setOnTouchListener { _, e ->
             when (e.action) {
@@ -110,6 +140,11 @@ class OverlayService : Service() {
         wm.addView(b, lp); bubble = b
     }
 
+    private fun panelHeight(): Int {
+        val hh = if (h > 0) h else resources.displayMetrics.heightPixels
+        return minOf(dp(380), (hh * 0.85).toInt())
+    }
+
     private fun addPanel() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -121,29 +156,26 @@ class OverlayService : Service() {
         head.addView(tv("⇄", 16f) { flip() })
         head.addView(tv("✕", 16f) { root.visibility = View.GONE })
         root.addView(head)
-        rowViews = KINDS.map { (k, _) -> tv("", 13f) { scan(k) } }
-        rowViews.forEach { root.addView(it) }
-        val o = tv("Open the matching FM screen, then tap a row above.", 12f)
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(btn("Scan") { scan() })
+        row.addView(btn("Advice") { st.reload(); say(Advisor.advise(st)) })
+        row.addView(btn("New match") { st.reload(); st.clearOpp(); refresh(); say("Opponent data cleared. Open the next opponent's Hub or Report and tap Scan.") })
+        root.addView(row)
+        val s = tv("", 11f); statusTv = s
+        root.addView(s)
+        val o = tv("Open any Tactics page, Pre-Match Hub, Next Match Report or a Player Profile, then tap Scan. The screen type is detected automatically.", 12f)
         outTv = o
         root.addView(ScrollView(this).apply { addView(o) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        val lp = overlayParams(dp(230), minOf(dp(340), (h.takeIf { it > 0 } ?: resources.displayMetrics.heightPixels).let { (it * 0.8).toInt() }),
-            Gravity.END or Gravity.CENTER_VERTICAL)
-        wm.addView(root, lp); panel = root; panelLp = lp; refreshRows()
+        val lp = overlayParams(dp(220), panelHeight(), Gravity.END or Gravity.CENTER_VERTICAL)
+        wm.addView(root, lp); panel = root; panelLp = lp; refresh()
     }
 
-    private fun refreshRows() {
-        val n = st.players().length()
-        val done = listOf(st.team.isNotBlank() || st.teamStr.isNotEmpty(), st.lineup.isNotEmpty(), n > 0, oppDone)
-        rowViews.forEachIndexed { i, v ->
-            val label = KINDS[i].second + (if (i == 2) " ($n saved)" else "")
-            v.text = (if (done[i]) "☑ " else "☐ ") + (i + 1) + ". " + label
-        }
-    }
+    private fun refresh() { st.reload(); statusTv?.text = Advisor.status(st) }
 
     private fun togglePanel() {
         val p = panel ?: return
         p.visibility = if (p.visibility == View.VISIBLE) View.GONE else View.VISIBLE
-        refreshRows()
+        refresh()
     }
 
     private fun flip() {
@@ -160,50 +192,40 @@ class OverlayService : Service() {
     }
 
     // Hide our own windows so the screenshot only contains the game, then OCR it.
-    private fun scan(kind: String) {
-        if (last == null) { say("No screen image yet. Wait a second and try again."); return }
+    private fun scan() {
+        val resized = ensureSize()
+        if (resized) panelLp?.let { it.height = panelHeight(); wm.updateViewLayout(panel, it) }
         val wasOpen = panel?.visibility == View.VISIBLE
         bubble?.visibility = View.INVISIBLE; panel?.visibility = View.INVISIBLE
         handler.postDelayed({
             fun restore() { bubble?.visibility = View.VISIBLE; panel?.visibility = if (wasOpen) View.VISIBLE else View.GONE }
             val img = last
-            if (img == null) { restore(); return@postDelayed }
+            if (img == null) { restore(); say("Screen not ready yet. Wait a second and tap Scan again."); return@postDelayed }
             val bmp = toBitmap(img)
             ocr.process(InputImage.fromBitmap(bmp, 0))
-                .addOnSuccessListener { r -> restore(); handle(kind, r) }
+                .addOnSuccessListener { r -> restore(); handle(r, bmp) }
                 .addOnFailureListener { restore(); say("Scan failed: ${it.message}") }
-        }, 600)
+        }, if (resized) 1300L else 700L)
     }
 
-    private fun handle(kind: String, r: Text) {
-        val lines = r.textBlocks.flatMap { it.lines }.map { Ln(it.text.trim(), it.boundingBox?.height() ?: 0, it.boundingBox?.top ?: 0) }
-        val text = r.text
-        when (kind) {
-            "team" -> {
-                val name = Engine.guessName(lines, h); val (s, wk) = Engine.sw(text); val f = Engine.formation(text)
-                if (name.isNotBlank()) st.team = name
-                if (s.isNotEmpty() || wk.isNotEmpty()) { st.teamStr = s; st.teamWeak = wk }
-                if (f.isNotBlank()) st.formation = f
-                say("MY TEAM saved\nName: ${name.ifBlank { "(not read, try the team overview screen)" }}\n" +
-                    "Strengths: ${s.joinToString().ifBlank { "-" }}\nWeaknesses: ${wk.joinToString().ifBlank { "-" }}")
-            }
-            "lineup" -> {
-                val f = Engine.formation(text); val n = Engine.names(lines)
-                if (f.isNotBlank()) st.formation = f
-                if (n.isNotEmpty()) st.lineup = n
-                say("LINEUP saved\nFormation: ${f.ifBlank { "-" }}\nPlayers: ${n.joinToString().ifBlank { "-" }}")
-            }
-            "player" -> {
-                val name = Engine.guessName(lines, h); val (s, wk) = Engine.sw(text)
-                if (name.isBlank()) say("Couldn't read the player's name. Open the player's profile and try again.")
-                else {
-                    st.savePlayer(name, s, wk)
-                    say("PLAYER saved: $name\nStrengths: ${s.joinToString().ifBlank { "-" }}\nWeaknesses: ${wk.joinToString().ifBlank { "-" }}")
-                }
-            }
-            else -> { oppDone = true; say(Engine.advise(text, lines, h, st)) }
+    private fun handle(r: Text, bmp: Bitmap) {
+        st.reload()
+        val lines = r.textBlocks.flatMap { it.lines }.mapNotNull { l -> l.boundingBox?.let { Ln(l.text.trim(), it.left, it.top, it.width(), it.height()) } }
+        val blocks = r.textBlocks.mapNotNull { b -> b.boundingBox?.let { Ln(b.text.replace("\n", " ").trim(), it.left, it.top, it.width(), it.height()) } }
+        val s = Scan(lines, blocks, r.text, bmp.width, bmp.height, bmp)
+        val kind = Parse.screen(r.text)
+        val team = Parse.teamName(s)
+        if (kind != "unknown" && kind != "player" && team.isNotBlank()) st.d.put("team", team)
+        val msg = when (kind) {
+            "formation" -> Parse.lineup(s, st)
+            "shape", "defence", "attack" -> Parse.tactic(s, kind, st)
+            "setpieces" -> "SET PIECES screen noted. The advice includes set-piece suggestions; use the Takers list to pick your best penalty taker."
+            "player" -> Parse.player(s, st)
+            "hub", "report" -> Parse.opp(s, st, kind == "hub") + "\n\n" + Advisor.advise(st)
+            else -> "Screen not recognised. Open Tactics (Formation, Shape, Defence or Attack), the Pre-Match Hub, Next Match > Report, or a Player Profile, then tap Scan."
         }
-        refreshRows()
+        st.save()
+        say(msg); refresh()
     }
 
     private fun toBitmap(img: Image): Bitmap {
