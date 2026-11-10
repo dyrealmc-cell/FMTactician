@@ -65,7 +65,9 @@ object Parse {
     fun screen(t: String): String {
         val l = t.lowercase()
         return when {
+            "tap tactical role" in l -> "role"
             "player profile" in l -> "player"
+            "club squad" in l -> "squad"
             "possession" in l && "clear cut" in l -> "match"
             "action zones" in l || "attack areas" in l -> "matchgfx"
             "pre-match hub" in l -> "hub"
@@ -91,9 +93,18 @@ object Parse {
         }.minByOrNull { it.y }?.t ?: ""
     }
 
-    fun teamName(s: Scan): String =
-        s.lines.filter { it.y < s.h * 0.09 && it.cx > s.w * 0.1 && it.cx < s.w * 0.5 && it.t.length in 3..30 && !it.t[0].isDigit() }
-            .minByOrNull { it.y }?.t ?: ""
+    fun teamName(s: Scan): String {
+        val bad = listOf("hub", "squad", "tactics", "profile", "report", "match", "attributes")
+        return s.lines.filter {
+            it.y < s.h * 0.09 && it.cx > s.w * 0.1 && it.cx < s.w * 0.5 && it.t.length in 3..30 && !it.t[0].isDigit() &&
+                !it.t.contains(" - ") && bad.none { w -> w in it.t.lowercase() }
+        }.minByOrNull { it.y }?.t ?: ""
+    }
+
+    fun sameClub(a: String, b: String): Boolean {
+        fun k(t: String) = t.lowercase().filter { it.isLetter() }.take(4)
+        return k(a) == k(b)
+    }
 
     private fun shapeOf(codes: List<String>): String {
         val out = codes.filter { it != "GK" }
@@ -164,12 +175,14 @@ object Parse {
     }
 
     fun player(s: Scan, st: Store): String {
-        val club = st.str("team").substringBefore(' ')
-        if (club.length >= 3 && !s.text.contains(club, true))
-            return "Skipped: this doesn't look like a ${st.str("team")} player."
         val nameRe = Regex("^\\d+\\.\\s*(.+)$")
-        val name = s.lines.firstOrNull { it.y < s.h * 0.14 && nameRe.matches(it.t) }?.let { nameRe.find(it.t)!!.groupValues[1].trim() }
+        val raw = s.lines.firstOrNull { it.y < s.h * 0.14 && nameRe.matches(it.t) }?.let { nameRe.find(it.t)!!.groupValues[1].trim() }
             ?: return "Couldn't read the player's name. Open the Player Profile screen and try again."
+        val squad = st.obj("squad")
+        val inSquad = Names.find(squad, raw)
+        if (squad.length() > 0 && inSquad == null)
+            return "Not in your recorded squad: $raw (not saved). If he should be, open Club Squad first so the app records the names."
+        val name = inSquad ?: raw
         val attrs = JSONObject()
         val nums = s.lines.filter { Regex("^\\d{1,2}$").matches(it.t) && it.t.toInt() in 1..20 }
         val labels = s.lines.filter { Regex("^[A-Za-z][A-Za-z .]{2,17}$").matches(it.t) && it.t.lowercase() !in ATTR_BAD }
@@ -192,14 +205,129 @@ object Parse {
         if (cond.isNotBlank()) attrs.put("_cond", cond)
         if (mor.isNotBlank()) attrs.put("_morale", mor)
         if (rat.isNotBlank()) attrs.put("_rating", rat)
-        st.obj("players").put(name, attrs)
+        val players = st.obj("players")
+        val existed = players.optJSONObject(name)?.has("_profile") == true
+        val cur = players.optJSONObject(name) ?: JSONObject().also { players.put(name, it) }
+        attrs.keys().forEach { k -> cur.put(k, attrs.get(k)) }
+        cur.put("_profile", true)
         val list = attrs.keys().asSequence().filter { !it.startsWith("_") }.map { it to attrs.getInt(it) }.toList()
         val str = list.filter { it.second >= 13 }.sortedByDescending { it.second }.joinToString { "${it.first} ${it.second}" }
         val wk = list.filter { it.second <= 9 }.sortedBy { it.second }.joinToString { "${it.first} ${it.second}" }
-        val su = suits(attrs)
-        return "PLAYER saved: $name${age?.let { " ($it)" } ?: ""}\nStrengths: ${str.ifBlank { "-" }}\nWeaknesses: ${wk.ifBlank { "-" }}" +
+        val g = Roles.group(squad.optString(name).ifBlank { attrs.optString("_pos") })
+        val sug = if (g.isNotBlank()) Roles.suggest(st, cur, g, 2) else emptyList()
+        return (if (existed) "ALREADY RECORDED: $name (values refreshed)" else "PLAYER saved: $name") +
+            (age?.let { " ($it)" } ?: "") + "\nStrengths: ${str.ifBlank { "-" }}\nWeaknesses: ${wk.ifBlank { "-" }}" +
             (if (cond.isNotBlank() || mor.isNotBlank()) "\nCondition ${cond.ifBlank { "?" }}, morale ${mor.ifBlank { "?" }}" else "") +
-            (if (su.isNotBlank()) "\nSuits: $su" else "")
+            (if (sug.isNotEmpty()) "\nSuggested role: " + sug.joinToString { "${it.first} ${"%.1f".format(it.second)}" } else "")
+    }
+
+    private val ABBR = mapOf(
+        "pac" to "Pace", "sta" to "Stamina", "str" to "Strength", "aer" to "Aerial", "cro" to "Crossing", "dri" to "Dribbling",
+        "pas" to "Passing", "sho" to "Shooting", "tac" to "Tackling", "tec" to "Technique", "agg" to "Aggression",
+        "cre" to "Creativity", "dec" to "Decisions", "lea" to "Leadership", "mov" to "Movement", "pos" to "Positioning", "tea" to "Teamwork"
+    )
+    private val SLOT = Regex("^(S\\d{1,2}|GK|DR|DL|DC|WBR|WBL|DMR|DML|DMC|MR|ML|MC|AMR|AML|AMC|FC|ST)$")
+    private val FULL = Regex("^\\p{Lu}[\\p{L}'’.-]*( [\\p{L}'’.-]+){0,3}$")
+    private fun clean(t: String) = t.replace(Regex("[^\\p{L}]+$"), "").trim()
+
+    /** Club Squad table (any attribute view): records names, positions and the visible attributes. */
+    fun squad(s: Scan, st: Store): String {
+        val hdr = s.lines.firstOrNull { it.t.equals("Name", true) && it.cx < s.w * 0.5 }
+            ?: return "Couldn't find the squad table. Open Club Squad and try again."
+        val heads = s.lines.filter { it !== hdr && Math.abs(it.cy - hdr.cy) < hdr.h && it.x > hdr.x + hdr.w && it.t.length in 2..4 }.sortedBy { it.cx }
+        if (heads.isEmpty()) return "Couldn't read the attribute columns on this squad view."
+        val gap = heads.zipWithNext { a, b -> b.cx - a.cx }.minOrNull() ?: 100
+        val tol = maxOf(gap / 2 - 2, 10)
+        val rows = s.lines.filter {
+            it.y > hdr.y + hdr.h && it.y < s.h * 0.93 && it.cx < s.w * 0.55 && it.x > s.w * 0.15 &&
+                clean(it.t).length >= 5 && FULL.matches(clean(it.t))
+        }.sortedBy { it.y }
+        if (rows.isEmpty()) return "No player names found on this screen."
+        val sq = st.obj("squad"); val ps = st.obj("players")
+        val fresh = mutableListOf<String>(); var known = 0
+        for (r in rows) {
+            val nm = clean(r.t)
+            val key = Names.find(sq, nm)
+            val k = key ?: nm
+            if (key == null) fresh.add(nm) else known++
+            val slot = s.lines.filter { SLOT.matches(it.t) && it.x < r.x && Math.abs(it.cy - r.cy) < r.h }.maxByOrNull { it.x }?.t ?: ""
+            if (slot.isNotBlank() || key == null) sq.put(k, if (slot.isNotBlank()) slot else sq.optString(k))
+            val cur = ps.optJSONObject(k) ?: JSONObject().also { ps.put(k, it) }
+            for (hd in heads) {
+                val v = s.lines.filter { Regex("^\\d{1,2}$").matches(it.t) && Math.abs(it.cx - hd.cx) < tol && Math.abs(it.cy - r.cy) < r.h * 0.8 }
+                    .minByOrNull { Math.abs(it.cx - hd.cx) }?.t?.toInt() ?: continue
+                if (v in 1..20) cur.put(ABBR[hd.t.lowercase()] ?: hd.t, v)
+            }
+        }
+        val codes = sq.keys().asSequence().map { sq.optString(it) }.filter { CODE.matches(it) }.toList()
+        shapeOf(codes).takeIf { it.isNotBlank() }?.let { st.d.put("derivedForm", it) }
+        val view = s.lines.firstOrNull { it.t.contains("Club Squad", true) }?.t?.substringAfter("-", "")?.trim() ?: ""
+        return "SQUAD $view read: ${fresh.size} new, $known already recorded.\n" +
+            (if (fresh.isNotEmpty()) "New: " + fresh.joinToString() + "\n" else "") +
+            "Total ${sq.length()} players. Scroll down and scan again for more; switch the attribute view (Physical, Technical, Mental) to add more stats."
+    }
+
+    private fun cleanRole(t: String) = t.replace(Regex("[^\\p{L} -]+$"), "").trim().replace(Regex("\\s+\\p{L}$"), "").trim()
+
+    private fun textColor(b: Bitmap, l: Ln): String {
+        var n = 0; var sr = 0L; var sg = 0L; var sb = 0L
+        var y = maxOf(l.y, 0)
+        while (y < minOf(l.y + l.h, b.height)) {
+            var x = maxOf(l.x, 0)
+            while (x < minOf(l.x + l.w, b.width)) {
+                val c = b.getPixel(x, y)
+                val r = Color.red(c); val g = Color.green(c); val bl = Color.blue(c)
+                if ((r + g + bl) / 3 > 130) { n++; sr += r; sg += g; sb += bl }
+                x += 2
+            }
+            y += 2
+        }
+        if (n < 5) return "none"
+        val r = sr / n; val g = sg / n; val bl = sb / n
+        return when {
+            g > r + 25 && g > bl + 5 -> "green"
+            bl > r + 35 && bl >= g -> "blue"
+            else -> "white"
+        }
+    }
+
+    /** The "Tap tactical role" window: records the game's recommended role and learns each role's key attributes. */
+    fun role(s: Scan, st: Store): String {
+        val instr = s.lines.firstOrNull { it.t.contains("tap tactical role", true) } ?: return "Couldn't read the role window."
+        val title = s.lines.filter { it.y < instr.y && instr.y - it.y < instr.h * 6 && it.cx < s.w * 0.5 && it.t.length >= 4 }
+            .maxByOrNull { it.y }?.t?.trim() ?: return "Couldn't read the player's name in the role window."
+        val descTop = s.lines.filter { it.y > instr.y + instr.h && it.t.length > 45 }.minOfOrNull { it.y } ?: s.h
+        val confirmY = s.lines.firstOrNull { it.t.equals("Confirm", true) }?.y ?: s.h
+        val ignore = setOf("marking", "zonal", "player", "recommended role", "confirm")
+        val opts = s.lines.filter { it.y > instr.y + instr.h * 0.5 && it.y < descTop - 4 }
+            .map { it to cleanRole(it.t) }
+            .filter { (_, n) -> n.length >= 3 && Regex("^[A-Za-z][A-Za-z -]+$").matches(n) && n.lowercase() !in ignore }
+        var assigned = ""; var rec = ""
+        opts.forEach { (l, n) ->
+            val c = textColor(s.bmp, l)
+            if (c == "green") assigned = n
+            if (c == "blue") rec = n
+            if (l.t.any { it == '★' || it == '*' || it == '☆' }) rec = n
+        }
+        val desc = s.lines.filter { it.y >= descTop - 2 && it.y < confirmY - 2 }.sortedBy { it.y }.joinToString(" ") { it.t }
+        fun nz(x: String) = x.lowercase().filter { it.isLetter() }
+        val pick = opts.map { it.second }.filter { nz(desc).contains(nz(it)) }.maxByOrNull { it.length } ?: ""
+        if (assigned.isBlank()) assigned = pick
+        if (rec.isBlank()) rec = assigned
+        val attrsTxt = Regex("primary attributes for this role are (.+)", RegexOption.IGNORE_CASE).find(desc)?.groupValues?.get(1)?.trim()?.trimEnd('.')
+        var learned = ""
+        if (attrsTxt != null && pick.isNotBlank()) {
+            val list = attrsTxt.split(Regex(",\\s*|\\s+and\\s+")).map { it.trim().replace("Aerial Ability", "Aerial") }.filter { it.isNotBlank() }
+            if (list.isNotEmpty()) { st.obj("roleAttrs").put(pick, JSONArray(list)); learned = "\nLearned for $pick: ${list.joinToString()}" }
+        }
+        val key = Names.find(st.obj("squad"), title) ?: title
+        st.obj("grole").put(key, JSONObject().put("assigned", assigned).put("rec", rec))
+        val names = opts.map { it.second }
+        val g = Roles.BY_GROUP.maxByOrNull { e -> e.value.count { it in names } }?.takeIf { e -> e.value.count { it in names } >= 2 }?.key ?: ""
+        val a = st.obj("players").optJSONObject(key)
+        val mine = if (a != null && g.isNotBlank()) Roles.suggest(st, a, g, 1).firstOrNull() else null
+        return "ROLE noted: $key\nCurrent: ${assigned.ifBlank { "?" }}\nGame recommends: ${rec.ifBlank { "?" }}$learned" +
+            (if (mine != null) "\nApp suggests: ${mine.first} (${"%.1f".format(mine.second)})" else "")
     }
 
     private fun num(t: String) = Regex("\\d+(\\.\\d+)?").find(t)?.value?.toDoubleOrNull() ?: 0.0
@@ -310,8 +438,9 @@ object Advisor {
     private fun sur(n: String) = (if (',' in n) n.substringBefore(',') else n.substringAfterLast(' ')).trim().lowercase()
 
     fun traits(st: Store): Pair<Set<String>, Set<String>> {
-        val ps = st.obj("players"); val lu = st.obj("lineup")
-        val starters = lu.keys().asSequence().map { sur(it) }.toSet()
+        val ps = st.obj("players"); val lu = st.obj("lineup"); val sq = st.obj("squad")
+        val xi = sq.keys().asSequence().filter { Parse.CODE.matches(sq.optString(it)) }.toList()
+        val starters = (if (xi.isNotEmpty()) xi else lu.keys().asSequence().toList()).map { sur(it) }.toSet()
         val names = ps.keys().asSequence().toList()
         val use = names.filter { starters.isEmpty() || sur(it) in starters }.ifEmpty { names }
         val strong = mutableSetOf<String>(); val weak = mutableSetOf<String>()
@@ -329,8 +458,9 @@ object Advisor {
         val pages = listOf("Team Mentality", "Defensive Line", "Final Third").count { tac.has(it) }
         fun m(ok: Boolean) = if (ok) "☑ " else "☐ "
         val lu = st.obj("lineup").length(); val pl = st.obj("players").length()
+        val sqo = st.obj("squad"); val xi = sqo.keys().asSequence().count { Parse.CODE.matches(sqo.optString(it)) }
         return m(st.str("team").isNotBlank()) + "Team " + st.str("team") + "\n" +
-            m(lu > 0) + "Lineup ($lu/11)\n" +
+            m(sqo.length() > 0 || lu > 0) + "Squad (${sqo.length()} players, $xi starters)\n" +
             m(pages == 3) + "Tactics ($pages/3: Shape, Defence, Attack)\n" +
             m(pl > 0) + "Players ($pl saved)\n" +
             m(o.length() > 0) + "Opponent " + o.optString("name")
@@ -352,6 +482,24 @@ object Advisor {
         pos.endsWith("L") -> "your right"
         pos.endsWith("R") -> "your left"
         else -> "the middle"
+    }
+
+    fun roles(st: Store): String {
+        val sq = st.obj("squad"); val ps = st.obj("players"); val gr = st.obj("grole")
+        val xi = sq.keys().asSequence().filter { Parse.CODE.matches(sq.optString(it)) }.toList()
+        if (xi.isEmpty()) return "Open Club Squad first (it gives your starters and their positions), then tap Roles."
+        val sb = StringBuilder("SUGGESTED ROLES (from attributes)\n")
+        var thin = 0
+        for (n in xi) {
+            val slot = sq.optString(n); val a = ps.optJSONObject(n)
+            val sug = if (a != null) Roles.suggest(st, a, Roles.group(slot), 2) else emptyList()
+            if (sug.isEmpty()) { thin++; sb.append("• $n ($slot): not enough attributes yet\n"); continue }
+            sb.append("• $n ($slot): ${sug.joinToString { "${it.first} ${"%.1f".format(it.second)}" }}")
+            gr.optJSONObject(n)?.let { sb.append(" | game: ${it.optString("rec")} recommended, now ${it.optString("assigned")}") }
+            sb.append("\n")
+        }
+        if (thin > 0) sb.append("\nTo fill the gaps: open Club Squad and switch the attribute view (Physical, Technical, Mental), or browse Player Profiles. Auto scan reads each one.")
+        return sb.toString()
     }
 
     private fun top(st: Store, a: String, n: Int = 2): String {
@@ -534,5 +682,126 @@ object Advisor {
         if (os.isBlank() && ow.isBlank()) sb.append("\nNo strengths or weaknesses read yet: scan the Hub and the Report.")
         if (st.obj("players").length() < 6) sb.append("\nTip: browse more Player Profiles so the app can learn your squad (${st.obj("players").length()} saved).")
         return sb.toString()
+    }
+}
+
+/** Matches names across screens: "Key, J" (tactics screens) and "Josh Key" (squad and profile screens). */
+object Names {
+    private fun norm(s: String) = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD)
+        .replace(Regex("\\p{M}+"), "").lowercase().replace(Regex("[^\\p{L} ,'-]"), " ").replace(Regex("\\s+"), " ").trim()
+
+    private fun match(sn: Pair<String, String>, toks: List<String>): Boolean {
+        val s = sn.first.split(" ")
+        if (!s.all { it in toks }) return false
+        val rest = toks.filter { it !in s }
+        return rest.isEmpty() || sn.second.isEmpty() || rest.any { it.startsWith(sn.second.take(1)) }
+    }
+
+    fun same(a: String, b: String): Boolean {
+        val x = norm(a); val y = norm(b)
+        if (x == y) return true
+        fun split(n: String): Pair<String, String>? = if (',' in n) n.substringBefore(',').trim() to n.substringAfter(',').trim() else null
+        val sa = split(x); val sb = split(y)
+        return when {
+            sa != null && sb != null -> sa.first == sb.first && sa.second.take(1) == sb.second.take(1)
+            sa != null -> match(sa, y.split(" "))
+            sb != null -> match(sb, x.split(" "))
+            else -> false
+        }
+    }
+
+    fun find(o: JSONObject, name: String): String? = o.keys().asSequence().firstOrNull { same(it, name) }
+}
+
+/** Role knowledge: roles per position and the attributes each role needs. Learned from the game's role window. */
+object Roles {
+    // Exact attribute lists for the roles seen in the game; the rest are estimates until the app reads them.
+    val DB: Map<String, List<String>> = mapOf(
+        "Poacher" to listOf("Movement", "Pace", "Technique", "Shooting", "Decisions"),
+        "Inside Forward" to listOf("Shooting", "Dribbling", "Movement", "Pace", "Decisions", "Passing"),
+        "Attacking Midfielder" to listOf("Movement", "Passing", "Decisions"),
+        "Box To Box Midfielder" to listOf("Movement", "Positioning", "Stamina", "Decisions", "Tackling", "Passing"),
+        "Defensive Midfielder" to listOf("Tackling", "Positioning", "Strength", "Decisions"),
+        "Full-Back" to listOf("Tackling", "Positioning", "Pace", "Decisions", "Passing"),
+        "Central Defender" to listOf("Tackling", "Positioning", "Decisions", "Strength", "Aerial"),
+        "Goalkeeper" to listOf("Handling", "Aerial", "Throwing", "Reflexes", "Kicking"),
+        "Complete Forward" to listOf("Shooting", "Movement", "Pace", "Strength", "Technique", "Decisions"),
+        "Target Forward" to listOf("Strength", "Aerial", "Shooting", "Teamwork"),
+        "Advanced Forward" to listOf("Pace", "Shooting", "Movement", "Dribbling", "Decisions"),
+        "Deep Lying Forward" to listOf("Passing", "Technique", "Teamwork", "Movement", "Shooting"),
+        "Pressing Forward" to listOf("Stamina", "Aggression", "Teamwork", "Pace", "Shooting"),
+        "Trequartista" to listOf("Creativity", "Dribbling", "Passing", "Technique", "Shooting"),
+        "Shadow Striker" to listOf("Movement", "Shooting", "Pace", "Decisions", "Stamina"),
+        "Winger" to listOf("Pace", "Crossing", "Dribbling", "Stamina", "Technique"),
+        "Inverted Winger" to listOf("Pace", "Dribbling", "Passing", "Technique", "Creativity"),
+        "Advanced Playmaker" to listOf("Passing", "Creativity", "Technique", "Decisions", "Movement"),
+        "Central Midfielder" to listOf("Passing", "Decisions", "Teamwork", "Stamina", "Tackling"),
+        "Anchor" to listOf("Positioning", "Tackling", "Decisions", "Strength", "Teamwork"),
+        "Roaming Playmaker" to listOf("Passing", "Stamina", "Movement", "Creativity", "Teamwork"),
+        "Deep Lying Playmaker" to listOf("Passing", "Decisions", "Technique", "Creativity", "Teamwork"),
+        "Ball Winning Midfielder" to listOf("Tackling", "Aggression", "Stamina", "Teamwork", "Strength"),
+        "Inverted Full Back" to listOf("Tackling", "Positioning", "Decisions", "Strength", "Passing"),
+        "Inverted Wing Back" to listOf("Tackling", "Passing", "Technique", "Pace", "Decisions"),
+        "Defensive Full Back" to listOf("Tackling", "Positioning", "Strength", "Decisions", "Aggression"),
+        "Wing-Back" to listOf("Pace", "Stamina", "Crossing", "Dribbling", "Tackling"),
+        "No-Nonsense Centre-Back" to listOf("Tackling", "Positioning", "Strength", "Aerial", "Aggression"),
+        "Sweeper" to listOf("Positioning", "Decisions", "Pace", "Passing", "Tackling"),
+        "Ball Playing Defender" to listOf("Passing", "Technique", "Tackling", "Positioning", "Decisions"),
+        "Wide Centre Back" to listOf("Pace", "Tackling", "Positioning", "Stamina", "Strength"),
+        "Libero" to listOf("Passing", "Technique", "Positioning", "Decisions", "Tackling"),
+        "Sweeper Keeper" to listOf("Handling", "Reflexes", "Kicking", "Throwing", "Decisions")
+    )
+
+    val BY_GROUP: Map<String, List<String>> = mapOf(
+        "F" to listOf("Poacher", "Deep Lying Forward", "Complete Forward", "Trequartista", "Target Forward", "Advanced Forward", "Pressing Forward"),
+        "W" to listOf("Winger", "Inside Forward", "Advanced Playmaker", "Inverted Winger"),
+        "AM" to listOf("Attacking Midfielder", "Advanced Playmaker", "Trequartista", "Shadow Striker"),
+        "MC" to listOf("Central Midfielder", "Anchor", "Box To Box Midfielder", "Roaming Playmaker", "Deep Lying Playmaker", "Ball Winning Midfielder", "Advanced Playmaker"),
+        "DM" to listOf("Defensive Midfielder", "Anchor", "Roaming Playmaker", "Deep Lying Playmaker", "Ball Winning Midfielder", "Box To Box Midfielder"),
+        "FB" to listOf("Full-Back", "Inverted Full Back", "Inverted Wing Back", "Defensive Full Back", "Wing-Back"),
+        "CB" to listOf("Central Defender", "No-Nonsense Centre-Back", "Sweeper", "Ball Playing Defender", "Wide Centre Back", "Libero"),
+        "GK" to listOf("Goalkeeper", "Sweeper Keeper")
+    )
+
+    fun group(t: String): String {
+        val c = t.trim()
+        if (Parse.CODE.matches(c)) return when (c) {
+            "GK" -> "GK"
+            "DR", "DL", "WBR", "WBL" -> "FB"
+            "DC" -> "CB"
+            "DMC", "DML", "DMR" -> "DM"
+            "MC" -> "MC"
+            "ML", "MR", "AML", "AMR" -> "W"
+            "AMC" -> "AM"
+            else -> "F"
+        }
+        val l = c.lowercase()
+        return when {
+            "goalkeeper" in l -> "GK"
+            "centre-back" in l || "central defender" in l || "centre back" in l -> "CB"
+            "full-back" in l || "wing-back" in l || "full back" in l -> "FB"
+            "defensive midfielder" in l -> "DM"
+            "attacking midfielder" in l -> "AM"
+            "winger" in l || "wide" in l -> "W"
+            "midfielder" in l -> "MC"
+            "forward" in l || "striker" in l -> "F"
+            else -> ""
+        }
+    }
+
+    fun attrsFor(st: Store, role: String): List<String> {
+        val l = st.obj("roleAttrs").optJSONArray(role)
+        return if (l != null && l.length() > 0) l.strs() else DB[role] ?: emptyList()
+    }
+
+    fun suggest(st: Store, a: JSONObject, g: String, n: Int = 2): List<Pair<String, Double>> {
+        val out = mutableListOf<Pair<String, Double>>()
+        for (r in BY_GROUP[g] ?: return emptyList()) {
+            val attrs = attrsFor(st, r)
+            val vals = attrs.mapNotNull { k -> if (a.has(k)) a.getInt(k) else null }
+            if (vals.isEmpty() || vals.size * 10 < attrs.size * 6) continue
+            out.add(r to vals.average())
+        }
+        return out.sortedByDescending { it.second }.take(n)
     }
 }

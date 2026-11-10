@@ -44,7 +44,11 @@ class OverlayService : Service() {
     private var scanning = false
     private var prevS: IntArray? = null
     private var doneS: IntArray? = null
-    private val AUTO = setOf("formation", "shape", "defence", "attack", "player")
+    private val AUTO = setOf("formation", "squad", "role", "shape", "defence", "attack", "player")
+    private val CLUB_KINDS = setOf("formation", "squad", "hub")
+    private var changed = true
+    private var idle = 0
+    private var lastSig = ""
     private val ticker = object : Runnable {
         override fun run() {
             try { autoTick() } catch (_: Exception) { busy = false }
@@ -123,11 +127,11 @@ class OverlayService : Service() {
     // (so not during live play) and it is a new screen, it is read once.
     private fun sample(img: Image): IntArray {
         val p = img.planes[0]; val buf = p.buffer
-        val out = IntArray(48 * 27)
-        for (j in 0 until 27) for (i in 0 until 48) {
-            val x = ((i + 0.5) * w / 48).toInt(); val y = ((j + 0.5) * h / 27).toInt()
+        val out = IntArray(64 * 36)
+        for (j in 0 until 36) for (i in 0 until 64) {
+            val x = ((i + 0.5) * w / 64).toInt(); val y = ((j + 0.5) * h / 36).toInt()
             val idx = y * p.rowStride + x * p.pixelStride
-            out[j * 48 + i] = ((buf.get(idx).toInt() and 0xFF) + (buf.get(idx + 1).toInt() and 0xFF) + (buf.get(idx + 2).toInt() and 0xFF)) / 3
+            out[j * 64 + i] = ((buf.get(idx).toInt() and 0xFF) + (buf.get(idx + 1).toInt() and 0xFF) + (buf.get(idx + 2).toInt() and 0xFF)) / 3
         }
         return out
     }
@@ -138,20 +142,33 @@ class OverlayService : Service() {
         return s.toDouble() / a.size
     }
 
+    // Reads a screen once after it has settled following a change. Pages that look alike
+    // (Shape, Defence, Attack, one player's profile and the next) are told apart by what is read.
     private fun autoTick() {
         if (!autoOn || busy || scanning) return
         val p = panel
-        if (p == null || p.visibility == View.VISIBLE) { prevS = null; return }
+        if (p == null || p.visibility == View.VISIBLE) { prevS = null; changed = true; return }
         val img = last ?: return
         val s = sample(img)
         val pv = prevS; prevS = s
-        if (pv == null || diff(s, pv) > 3.0) return
-        val dn = doneS
-        if (dn != null && diff(s, dn) < 3.0) return
-        doneS = s; busy = true
+        if (pv == null) return
+        if (diff(s, pv) > 0.5) { changed = true; idle = 0; return }
+        idle++
+        if (!changed && idle < 20) return
+        changed = false; idle = 0
+        busy = true
         val bmp = toBitmap(img)
         ocr.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener { r -> busy = false; if (process(r, bmp, true) != null) { refresh(); flash() } }
+            .addOnSuccessListener { r ->
+                busy = false
+                val kind = Parse.screen(r.text)
+                if (kind !in AUTO) return@addOnSuccessListener
+                val sig = kind + r.text.hashCode()
+                if (sig == lastSig) return@addOnSuccessListener
+                lastSig = sig
+                val m = process(r, bmp, true)
+                if (m != null) { outTv?.text = m; refresh(); flash() }
+            }
             .addOnFailureListener { busy = false }
     }
 
@@ -220,11 +237,12 @@ class OverlayService : Service() {
         val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         head.addView(tv("FM Tactician", 14f).apply { layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) })
         head.addView(tv("⇄", 16f) { flip() })
-        head.addView(tv("✕", 16f) { root.visibility = View.GONE })
+        head.addView(tv("✕", 16f) { root.visibility = View.GONE; changed = true })
         root.addView(head)
         val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row1.addView(btn("Scan") { scan() })
         row1.addView(btn("Advice") { st.reload(); say(Advisor.advise(st)) })
+        row1.addView(btn("Roles") { st.reload(); say(Advisor.roles(st)) })
         root.addView(row1)
         val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val ab = btn("Auto: ON") { toggleAuto() }; autoBtn = ab
@@ -233,7 +251,7 @@ class OverlayService : Service() {
         root.addView(row2)
         val s = tv("", 11f); statusTv = s
         root.addView(s)
-        val o = tv("Auto is ON: close this window and browse your squad, tactics and player screens; they are saved by themselves (the bubble shows ✓). For the opponent (Hub or Report) and for live match stats, open the screen and tap Scan.", 12f)
+        val o = tv("Auto is ON. Close this window (✕) and just browse: Club Squad, role windows, tactics pages and player profiles are saved by themselves (the bubble shows ✓). Auto pauses while this window is open. For the opponent (Hub or Report) and live match stats, open the screen and tap Scan.", 12f)
         outTv = o
         root.addView(ScrollView(this).apply { addView(o) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         val lp = overlayParams(dp(220), panelHeight(), Gravity.END or Gravity.CENTER_VERTICAL)
@@ -245,6 +263,7 @@ class OverlayService : Service() {
     private fun togglePanel() {
         val p = panel ?: return
         p.visibility = if (p.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        changed = true
         refresh()
     }
 
@@ -280,7 +299,7 @@ class OverlayService : Service() {
         }, if (resized) 1300L else 700L)
     }
 
-    /** Reads a screen. In auto mode only squad/tactics/player screens are saved; returns null when skipped. */
+    /** Reads a screen. In auto mode only squad, role, tactics and player screens are saved; returns null when skipped. */
     private fun process(r: Text, bmp: Bitmap, auto: Boolean): String? {
         val kind = Parse.screen(r.text)
         if (auto && kind !in AUTO) return null
@@ -288,20 +307,31 @@ class OverlayService : Service() {
         val lines = r.textBlocks.flatMap { it.lines }.mapNotNull { l -> l.boundingBox?.let { Ln(l.text.trim(), it.left, it.top, it.width(), it.height()) } }
         val blocks = r.textBlocks.mapNotNull { b -> b.boundingBox?.let { Ln(b.text.replace("\n", " ").trim(), it.left, it.top, it.width(), it.height()) } }
         val s = Scan(lines, blocks, r.text, bmp.width, bmp.height, bmp)
+        var note = ""
+        // Works for any club: the club is learned from the screens, and a different club (seen twice) starts fresh.
         val team = Parse.teamName(s)
-        if (kind != "unknown" && kind != "player" && kind != "match" && kind != "matchgfx" && team.isNotBlank()) st.d.put("team", team)
+        if (team.isNotBlank() && kind in CLUB_KINDS) {
+            val old = st.str("team")
+            if (old.isBlank()) st.d.put("team", team)
+            else if (!Parse.sameClub(team, old)) {
+                if (st.str("pendTeam") == team) { st.clear(); st.d.put("team", team); note = "New club detected: $team. Previous data cleared.\n\n"; lastSig = "" }
+                else st.d.put("pendTeam", team)
+            } else st.d.remove("pendTeam")
+        }
         val msg = when (kind) {
             "formation" -> Parse.lineup(s, st)
+            "squad" -> Parse.squad(s, st)
+            "role" -> Parse.role(s, st)
             "shape", "defence", "attack" -> Parse.tactic(s, kind, st)
             "setpieces" -> "SET PIECES screen noted. The advice includes set-piece suggestions; use the Takers list to pick your best penalty taker."
             "player" -> Parse.player(s, st)
             "match" -> Parse.match(s, st)
             "matchgfx" -> "This is a graphic screen. Open the match Stats overview (possession, shots, clear-cut chances) and tap Scan."
             "hub", "report" -> Parse.opp(s, st, kind == "hub") + "\n\n" + Advisor.advise(st)
-            else -> "Screen not recognised. Open Tactics (Formation, Shape, Defence or Attack), the Pre-Match Hub, Next Match > Report, the match Stats overview, or a Player Profile, then tap Scan."
+            else -> "Screen not recognised. Open Club Squad, Tactics (Formation, Shape, Defence or Attack), the Pre-Match Hub, Next Match > Report, the match Stats overview, a role window or a Player Profile, then tap Scan."
         }
         st.save()
-        return msg
+        return note + msg
     }
 
     private fun toBitmap(img: Image): Bitmap {

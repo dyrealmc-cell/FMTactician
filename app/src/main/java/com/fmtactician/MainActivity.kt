@@ -27,7 +27,9 @@ class MainActivity : Activity() {
             text = "Setup, once:\n1. Allow display over other apps.\n2. Start the bubble.\n\n" +
                 "Then just play in Football Manager (landscape). With Auto ON the app saves these by itself when you open them (the bubble shows a tick):\n" +
                 "• Tactics > Formation, Shape, Defence, Attack\n" +
-                "• Player Profiles (open each starter once)\n\n" +
+                "• Club Squad (scroll it, and switch the Physical, Technical and Mental views)\n" +
+                "• A player's role window\n" +
+                "• Player Profiles (only players of your own squad are saved)\n\n" +
                 "Tap the bubble, then Scan, for:\n" +
                 "• Pre-Match Hub and Next Match > Report (opponent): gives advice for Shape, Defence, Attack, Set Pieces and Game Plan\n" +
                 "• Match Stats overview during a game: live advice\n" +
