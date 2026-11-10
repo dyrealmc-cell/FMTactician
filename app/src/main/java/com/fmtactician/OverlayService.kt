@@ -30,12 +30,27 @@ class OverlayService : Service() {
     private var panelLp: WindowManager.LayoutParams? = null
     private var outTv: TextView? = null
     private var statusTv: TextView? = null
+    private var autoBtn: TextView? = null
     private var projection: MediaProjection? = null
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
     private var last: Image? = null
     private var w = 0; private var h = 0
     private val ocr = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
+    // Automatic scanning
+    private var autoOn = true
+    private var busy = false
+    private var scanning = false
+    private var prevS: IntArray? = null
+    private var doneS: IntArray? = null
+    private val AUTO = setOf("formation", "shape", "defence", "attack", "player")
+    private val ticker = object : Runnable {
+        override fun run() {
+            try { autoTick() } catch (_: Exception) { busy = false }
+            handler.postDelayed(this, 800)
+        }
+    }
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -47,6 +62,7 @@ class OverlayService : Service() {
             projection = mpm.getMediaProjection(Activity.RESULT_OK, data)
             projection?.registerCallback(object : MediaProjection.Callback() { override fun onStop() { stopSelf() } }, handler)
             startCapture()
+            handler.removeCallbacks(ticker); handler.postDelayed(ticker, 1500)
         }
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         if (bubble == null) addBubble()
@@ -93,6 +109,7 @@ class OverlayService : Service() {
         if (dm.widthPixels == w && dm.heightPixels == h) return false
         w = dm.widthPixels; h = dm.heightPixels
         last?.close(); last = null
+        prevS = null; doneS = null
         val old = reader
         reader = newReader()
         vd?.resize(w, h, dm.densityDpi)
@@ -101,6 +118,55 @@ class OverlayService : Service() {
         return true
     }
 
+    // ---------- Automatic scanning ----------
+    // Looks at a coarse grid of the screen. When the screen has settled after a change
+    // (so not during live play) and it is a new screen, it is read once.
+    private fun sample(img: Image): IntArray {
+        val p = img.planes[0]; val buf = p.buffer
+        val out = IntArray(48 * 27)
+        for (j in 0 until 27) for (i in 0 until 48) {
+            val x = ((i + 0.5) * w / 48).toInt(); val y = ((j + 0.5) * h / 27).toInt()
+            val idx = y * p.rowStride + x * p.pixelStride
+            out[j * 48 + i] = ((buf.get(idx).toInt() and 0xFF) + (buf.get(idx + 1).toInt() and 0xFF) + (buf.get(idx + 2).toInt() and 0xFF)) / 3
+        }
+        return out
+    }
+
+    private fun diff(a: IntArray, b: IntArray): Double {
+        var s = 0L
+        for (i in a.indices) s += Math.abs(a[i] - b[i])
+        return s.toDouble() / a.size
+    }
+
+    private fun autoTick() {
+        if (!autoOn || busy || scanning) return
+        val p = panel
+        if (p == null || p.visibility == View.VISIBLE) { prevS = null; return }
+        val img = last ?: return
+        val s = sample(img)
+        val pv = prevS; prevS = s
+        if (pv == null || diff(s, pv) > 3.0) return
+        val dn = doneS
+        if (dn != null && diff(s, dn) < 3.0) return
+        doneS = s; busy = true
+        val bmp = toBitmap(img)
+        ocr.process(InputImage.fromBitmap(bmp, 0))
+            .addOnSuccessListener { r -> busy = false; if (process(r, bmp, true) != null) { refresh(); flash() } }
+            .addOnFailureListener { busy = false }
+    }
+
+    private fun flash() {
+        bubble?.text = "✓"
+        handler.postDelayed({ bubble?.text = "⚽" }, 1500)
+    }
+
+    private fun toggleAuto() {
+        autoOn = !autoOn; prevS = null; doneS = null
+        autoBtn?.text = if (autoOn) "Auto: ON" else "Auto: OFF"
+        say(if (autoOn) "Auto ON: close this window and browse. Squad, tactics and player screens are saved by themselves (the bubble shows ✓). Opponent and match screens need Scan." else "Auto OFF: use Scan for everything.")
+    }
+
+    // ---------- UI ----------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun overlayParams(wd: Int, ht: Int, grav: Int) = WindowManager.LayoutParams(wd, ht,
@@ -156,14 +222,18 @@ class OverlayService : Service() {
         head.addView(tv("⇄", 16f) { flip() })
         head.addView(tv("✕", 16f) { root.visibility = View.GONE })
         root.addView(head)
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(btn("Scan") { scan() })
-        row.addView(btn("Advice") { st.reload(); say(Advisor.advise(st)) })
-        row.addView(btn("New match") { st.reload(); st.clearOpp(); refresh(); say("Opponent data cleared. Open the next opponent's Hub or Report and tap Scan.") })
-        root.addView(row)
+        val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row1.addView(btn("Scan") { scan() })
+        row1.addView(btn("Advice") { st.reload(); say(Advisor.advise(st)) })
+        root.addView(row1)
+        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val ab = btn("Auto: ON") { toggleAuto() }; autoBtn = ab
+        row2.addView(ab)
+        row2.addView(btn("New match") { st.reload(); st.clearOpp(); refresh(); say("Opponent data cleared. Open the next opponent's Hub or Report and tap Scan.") })
+        root.addView(row2)
         val s = tv("", 11f); statusTv = s
         root.addView(s)
-        val o = tv("Open any Tactics page, Pre-Match Hub, Next Match Report or a Player Profile, then tap Scan. The screen type is detected automatically.", 12f)
+        val o = tv("Auto is ON: close this window and browse your squad, tactics and player screens; they are saved by themselves (the bubble shows ✓). For the opponent (Hub or Report) and for live match stats, open the screen and tap Scan.", 12f)
         outTv = o
         root.addView(ScrollView(this).apply { addView(o) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         val lp = overlayParams(dp(220), panelHeight(), Gravity.END or Gravity.CENTER_VERTICAL)
@@ -191,8 +261,10 @@ class OverlayService : Service() {
         (outTv?.parent as? ScrollView)?.scrollTo(0, 0)
     }
 
+    // ---------- Manual scan ----------
     // Hide our own windows so the screenshot only contains the game, then OCR it.
     private fun scan() {
+        scanning = true
         val resized = ensureSize()
         if (resized) panelLp?.let { it.height = panelHeight(); wm.updateViewLayout(panel, it) }
         val wasOpen = panel?.visibility == View.VISIBLE
@@ -200,43 +272,49 @@ class OverlayService : Service() {
         handler.postDelayed({
             fun restore() { bubble?.visibility = View.VISIBLE; panel?.visibility = if (wasOpen) View.VISIBLE else View.GONE }
             val img = last
-            if (img == null) { restore(); say("Screen not ready yet. Wait a second and tap Scan again."); return@postDelayed }
+            if (img == null) { scanning = false; restore(); say("Screen not ready yet. Wait a second and tap Scan again."); return@postDelayed }
             val bmp = toBitmap(img)
             ocr.process(InputImage.fromBitmap(bmp, 0))
-                .addOnSuccessListener { r -> restore(); handle(r, bmp) }
-                .addOnFailureListener { restore(); say("Scan failed: ${it.message}") }
+                .addOnSuccessListener { r -> scanning = false; restore(); say(process(r, bmp, false) ?: ""); refresh() }
+                .addOnFailureListener { scanning = false; restore(); say("Scan failed: ${it.message}") }
         }, if (resized) 1300L else 700L)
     }
 
-    private fun handle(r: Text, bmp: Bitmap) {
+    /** Reads a screen. In auto mode only squad/tactics/player screens are saved; returns null when skipped. */
+    private fun process(r: Text, bmp: Bitmap, auto: Boolean): String? {
+        val kind = Parse.screen(r.text)
+        if (auto && kind !in AUTO) return null
         st.reload()
         val lines = r.textBlocks.flatMap { it.lines }.mapNotNull { l -> l.boundingBox?.let { Ln(l.text.trim(), it.left, it.top, it.width(), it.height()) } }
         val blocks = r.textBlocks.mapNotNull { b -> b.boundingBox?.let { Ln(b.text.replace("\n", " ").trim(), it.left, it.top, it.width(), it.height()) } }
         val s = Scan(lines, blocks, r.text, bmp.width, bmp.height, bmp)
-        val kind = Parse.screen(r.text)
         val team = Parse.teamName(s)
-        if (kind != "unknown" && kind != "player" && team.isNotBlank()) st.d.put("team", team)
+        if (kind != "unknown" && kind != "player" && kind != "match" && kind != "matchgfx" && team.isNotBlank()) st.d.put("team", team)
         val msg = when (kind) {
             "formation" -> Parse.lineup(s, st)
             "shape", "defence", "attack" -> Parse.tactic(s, kind, st)
             "setpieces" -> "SET PIECES screen noted. The advice includes set-piece suggestions; use the Takers list to pick your best penalty taker."
             "player" -> Parse.player(s, st)
+            "match" -> Parse.match(s, st)
+            "matchgfx" -> "This is a graphic screen. Open the match Stats overview (possession, shots, clear-cut chances) and tap Scan."
             "hub", "report" -> Parse.opp(s, st, kind == "hub") + "\n\n" + Advisor.advise(st)
-            else -> "Screen not recognised. Open Tactics (Formation, Shape, Defence or Attack), the Pre-Match Hub, Next Match > Report, or a Player Profile, then tap Scan."
+            else -> "Screen not recognised. Open Tactics (Formation, Shape, Defence or Attack), the Pre-Match Hub, Next Match > Report, the match Stats overview, or a Player Profile, then tap Scan."
         }
         st.save()
-        say(msg); refresh()
+        return msg
     }
 
     private fun toBitmap(img: Image): Bitmap {
         val p = img.planes[0]
+        val buf = p.buffer; buf.rewind()
         val pad = (p.rowStride - p.pixelStride * w) / p.pixelStride
         val full = Bitmap.createBitmap(w + pad, h, Bitmap.Config.ARGB_8888)
-        full.copyPixelsFromBuffer(p.buffer)
+        full.copyPixelsFromBuffer(buf)
         return Bitmap.createBitmap(full, 0, 0, w, h)
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         panel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         bubble?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         last?.close(); vd?.release(); reader?.close(); projection?.stop(); super.onDestroy()

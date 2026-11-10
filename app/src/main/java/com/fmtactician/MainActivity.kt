@@ -25,11 +25,12 @@ class MainActivity : Activity() {
         root.addView(TextView(this).apply { text = "FM Tactician"; textSize = 26f; gravity = Gravity.CENTER })
         root.addView(TextView(this).apply { textSize = 15f; setPadding(0, (12*d).toInt(), 0, (12*d).toInt())
             text = "Setup, once:\n1. Allow display over other apps.\n2. Start the bubble.\n\n" +
-                "In Football Manager (landscape), tap the ⚽ bubble, open a screen, then tap Scan. The app detects the screen itself:\n" +
-                "• Tactics > Formation: saves your lineup\n" +
-                "• Tactics > Shape, Defence, Attack: saves your current settings\n" +
-                "• Player Profile: saves that player's attributes (repeat for each starter)\n" +
-                "• Pre-Match Hub and Next Match > Report: reads the opponent and gives advice for Shape, Defence, Attack and Set Pieces.\n" +
+                "Then just play in Football Manager (landscape). With Auto ON the app saves these by itself when you open them (the bubble shows a tick):\n" +
+                "• Tactics > Formation, Shape, Defence, Attack\n" +
+                "• Player Profiles (open each starter once)\n\n" +
+                "Tap the bubble, then Scan, for:\n" +
+                "• Pre-Match Hub and Next Match > Report (opponent): gives advice for Shape, Defence, Attack, Set Pieces and Game Plan\n" +
+                "• Match Stats overview during a game: live advice\n" +
                 "On the Report, scan once showing Strengths and again showing Weaknesses." })
         root.addView(Button(this).apply { text = "1. Allow display over other apps"; setOnClickListener {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) } })
